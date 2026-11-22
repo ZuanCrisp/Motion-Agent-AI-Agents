@@ -1,0 +1,101 @@
+name: Sync Packs
+
+# Manual only. Setiap pack iart-ai/<pack> di-snapshot ke branch <pack> di repo ini.
+on:
+  workflow_dispatch:
+    inputs:
+      packs:
+        description: 'all, atau daftar nama pack dipisah koma'
+        required: false
+        default: 'all'
+      upstream_owner:
+        description: 'Owner GitHub upstream'
+        required: false
+        default: 'iart-ai'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-packs
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        shell: bash
+        env:
+          INPUT_PACKS: ${{ inputs.packs }}
+        run: |
+          set -euo pipefail
+          ALL='["tiktok-video-skills","text-message-video-skills","youtube-video-skills","ecommerce-video-skills","ad-video-skills","data-animation-skills","explainer-video-skills","map-animation-skills","web-animation-skills","motion-design-skills","kinetic-typography-skills","freelance-motion-skills","webgl-animation-skills","manim-skills","generative-illustration-skills","javascript-animation-skills","lower-thirds-skills","b-roll-skills","talking-head-skills"]'
+          if [ -z "${INPUT_PACKS}" ] || [ "${INPUT_PACKS}" = "all" ]; then
+            SEL="$ALL"
+          else
+            SEL=$(echo "${INPUT_PACKS}" | tr -d ' ' | jq -R 'split(",") | map(select(length>0))')
+            BAD=$(jq -nr --argjson a "$ALL" --argjson s "$SEL" '($s - $a) | join(",")')
+            if [ -n "$BAD" ]; then
+              echo "::error::Pack tidak dikenal: $BAD"
+              exit 1
+            fi
+          fi
+          echo "matrix=$(jq -nc --argjson p "$SEL" '{pack:$p}')" >> "$GITHUB_OUTPUT"
+
+  sync:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync ${{ matrix.pack }}
+        shell: bash
+        env:
+          PACK: ${{ matrix.pack }}
+          UP_OWNER: ${{ inputs.upstream_owner }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          UP_DIR="$RUNNER_TEMP/up-$PACK"
+          rm -rf "$UP_DIR"
+          git clone --depth 1 "https://github.com/${UP_OWNER}/${PACK}.git" "$UP_DIR"
+          UP_SHA=$(git -C "$UP_DIR" rev-parse HEAD)
+          rm -rf "$UP_DIR/.git" "$UP_DIR/.github/workflows"
+
+          NEW=0
+          if git rev-parse --verify -q "refs/remotes/origin/${PACK}" >/dev/null; then
+            git checkout -q -B "$PACK" "origin/${PACK}"
+            LAST=$(git log -1 --format=%B | sed -n 's/^Upstream-SHA: //p' | head -n 1)
+            if [ "$LAST" = "$UP_SHA" ]; then
+              echo "### ${PACK}: sudah up-to-date (${UP_SHA:0:7})" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          else
+            NEW=1
+            git checkout -q --orphan "$PACK"
+          fi
+
+          git rm -rq --ignore-unmatch . || true
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "$UP_DIR/." .
+          git add -A -f .
+
+          if [ "$NEW" = "0" ] && git diff --cached --quiet; then
+            echo "### ${PACK}: isi tidak berubah (${UP_SHA:0:7})" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git commit -q -m "Sync ${PACK} from ${UP_OWNER}/${PACK}@${UP_SHA:0:7}" -m "Upstream-SHA: ${UP_SHA}"
+          git push origin "HEAD:refs/heads/${PACK}"
+          echo "### ${PACK}: dipush ke branch ${PACK} (${UP_SHA:0:7})" >> "$GITHUB_STEP_SUMMARY"
